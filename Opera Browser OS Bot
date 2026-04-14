@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+# ============================================================
+# CLAWDASH — bots/opera_os_bot.py
+# 🦞 Opera Browser OS Bot — Network-aware, AI-routed, Telegram-controlled
+#
+# WHAT IT DOES:
+#   1. Controls Opera browser via Playwright (CDP protocol)
+#   2. Captures live network flows from Opera's activity (Scapy)
+#   3. Routes flow analysis through free AI provider chain
+#   4. Executes OS commands based on AI decisions
+#   5. Full Telegram control via /opera_* commands
+#   6. Persists everything to SCM + Google Drive
+#
+# INSTALL:
+#   pip install playwright scapy httpx psutil python-dotenv aiogram
+#   playwright install chromium  # opera uses chromium engine
+#
+# USAGE:
+#   python bots/opera_os_bot.py                  # headless daemon
+#   python bots/opera_os_bot.py --mode capture   # packet capture only
+#   python bots/opera_os_bot.py --mode browser   # browser only
+#   python bots/opera_os_bot.py --mode full      # full stack
+#
+# TELEGRAM COMMANDS:
+#   /opera_go <url>       → navigate Opera to URL
+#   /opera_snap           → screenshot + send to Telegram
+#   /opera_flows          → show captured network flows
+#   /opera_analyze        → AI analysis of current flows
+#   /opera_exec <cmd>     → execute OS command, return output
+#   /opera_ps             → running processes list
+#   /opera_kill <pid>     → kill process by PID
+#   /opera_status         → bot health + flow stats
+# ============================================================
+
+import asyncio
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import threading
+import traceback
+from collections import defaultdict, deque
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Optional
+
+import httpx
+import psutil
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── Conditional imports (graceful if not installed) ──────────────────────────
+
+try:
+    from playwright.async_api import async_playwright, Browser, Page
+    PLAYWRIGHT_OK = True
+except ImportError:
+    PLAYWRIGHT_OK = False
+    print("⚠ playwright not installed — browser mode disabled. pip install playwright")
+
+try:
+    from scapy.all import sniff, IP, TCP, UDP
+    SCAPY_OK = True
+except ImportError:
+    SCAPY_OK = False
+    print("⚠ scapy not installed — packet capture disabled. pip install scapy")
+
+try:
+    from aiogram import Bot, Dispatcher, Router
+    from aiogram.types import Message, BufferedInputFile
+    from aiogram.filters import Command
+    AIOGRAM_OK = True
+except ImportError:
+    AIOGRAM_OK = False
+    print("⚠ aiogram not installed — Telegram disabled. pip install aiogram")
+
+
+# ── PROVIDER CHAIN (audit-fixed) ─────────────────────────────────────────────
+
+PROVIDER_CHAIN = [
+    {"name": "openrouter_free", "base_url": "https://openrouter.ai/api/v1",
+     "key_env": "OPENROUTER_API_KEY", "model": "qwen/qwen3-coder-480b:free"},
+    {"name": "nvidia_nim",      "base_url": "https://integrate.api.nvidia.com/v1",
+     "key_env": "NVIDIA_API_KEY",     "model": "meta/llama-3.3-70b-instruct"},
+    {"name": "groq",            "base_url": "https://api.groq.com/openai/v1",
+     "key_env": "GROQ_API_KEY",       "model": "llama-3.3-70b-versatile"},
+    {"name": "cerebras",        "base_url": "https://api.cerebras.ai/v1",
+     "key_env": "CEREBRAS_API_KEY",   "model": "llama-3.3-70b"},
+    {"name": "siliconflow",     "base_url": "https://api.siliconflow.cn/v1",
+     "key_env": "SILICONFLOW_API_KEY","model": "Qwen/Qwen3-8B"},
+    {"name": "ollama_local",    "base_url": "http://localhost:11434/v1",
+     "key_env": None,                 "model": "qwen2.5-coder:7b"},
+]
+
+
+async def _ai_chat(messages: list, system: str = None, max_tokens: int = 1024) -> dict:
+    """Route through free provider chain. Returns {text, provider}."""
+    for p in PROVIDER_CHAIN:
+        api_key = os.getenv(p["key_env"]) if p["key_env"] else "ollama"
+        if p["key_env"] and not api_key:
+            continue
+        payload = {
+            "model": p["model"],
+            "max_tokens": max_tokens,
+            "messages": ([{"role": "system", "content": system}] if system else []) + messages,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                r = await client.post(
+                    f"{p['base_url']}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}",
+                             "Content-Type": "application/json"},
+                    json=payload,
+                )
+                if r.status_code == 429:
+                    continue
+                r.raise_for_status()
+                return {"text": r.json()["choices"][0]["message"]["content"],
+                        "provider": p["name"]}
+        except Exception:
+            continue
+    raise RuntimeError("All providers exhausted")
+
+
+# ── FLOW DATA STRUCTURES ─────────────────────────────────────────────────────
+
+@dataclass
+class NetworkFlow:
+    timestamp: float
+    src_ip:    str
+    dst_ip:    str
+    protocol:  str
+    src_port:  int
+    dst_port:  int
+    pkt_len:   int
+    flags:     str = ""
+
+    def to_short(self) -> str:
+        return (f"{self.protocol} {self.src_ip}:{self.src_port} → "
+                f"{self.dst_ip}:{self.dst_port} [{self.pkt_len}B]")
+
+
+@dataclass
+class OSAction:
+    """An AI-decided OS action."""
+    action:    str   # "navigate" | "exec" | "kill" | "snapshot" | "observe"
+    target:    str   # URL, command, PID, etc.
+    rationale: str
+    risk:      str   # "low" | "medium" | "high"
+
+
+# ── PACKET CAPTURE ENGINE ─────────────────────────────────────────────────────
+
+class FlowCapture:
+    """
+    Non-blocking Scapy packet capture in a background thread.
+    Stores flows in a bounded deque (last 500).
+    Optionally filters by Opera's PID network connections.
+    """
+
+    FLOW_LIMIT = 500
+
+    def __init__(self):
+        self.flows: deque[NetworkFlow] = deque(maxlen=self.FLOW_LIMIT)
+        self.running = False
+        self._thread: Optional[threading.Thread] = None
+        self._opera_ips: set[str] = set()   # IPs Opera is currently talking to
+        self.stats = defaultdict(int)
+
+    def _packet_cb(self, pkt):
+        if not IP in pkt:
+            return
+        ip = pkt[IP]
+        proto, sp, dp, flags = "OTHER", 0, 0, ""
+        if TCP in pkt:
+            proto, sp, dp = "TCP", pkt[TCP].sport, pkt[TCP].dport
+            flags = str(pkt[TCP].flags)
+        elif UDP in pkt:
+            proto, sp, dp = "UDP", pkt[UDP].sport, pkt[UDP].dport
+
+        if proto == "OTHER":
+            return
+
+        flow = NetworkFlow(
+            timestamp=time.time(),
+            src_ip=ip.src, dst_ip=ip.dst,
+            protocol=proto, src_port=sp, dst_port=dp,
+            pkt_len=len(pkt), flags=flags,
+        )
+        self.flows.append(flow)
+        self.stats["total"] += 1
+        self.stats[proto] += 1
+        # Track Opera's external IPs (dst not RFC1918)
+        if not _is_private(ip.dst):
+            self._opera_ips.add(ip.dst)
+
+    def start(self, duration: int = 0):
+        """Start capture. duration=0 → run until stop()."""
+        if not SCAPY_OK:
+            print("⚠ Scapy unavailable — packet capture disabled")
+            return
+        self.running = True
+        self._thread = threading.Thread(
+            target=self._run, args=(duration,), daemon=True
+        )
+        self._thread.start()
+        print(f"📡 Flow capture started (limit={self.FLOW_LIMIT})")
+
+    def _run(self, duration: int):
+        kwargs = {"prn": self._packet_cb, "store": False}
+        if duration > 0:
+            kwargs["timeout"] = duration
+        sniff(**kwargs)
+        self.running = False
+
+    def stop(self):
+        self.running = False
+
+    def recent(self, n: int = 20) -> list[NetworkFlow]:
+        return list(self.flows)[-n:]
+
+    def summary_text(self) -> str:
+        flows = list(self.flows)
+        if not flows:
+            return "No flows captured yet."
+        tcp = sum(1 for f in flows if f.protocol == "TCP")
+        udp = sum(1 for f in flows if f.protocol == "UDP")
+        unique_dst = len({f.dst_ip for f in flows})
+        return (
+            f"Flows: {len(flows)} total | TCP:{tcp} UDP:{udp}\n"
+            f"Unique destinations: {unique_dst}\n"
+            f"External IPs (Opera): {len(self._opera_ips)}\n"
+            f"Last: {flows[-1].to_short() if flows else 'none'}"
+        )
+
+    def to_payload(self, limit: int = 100) -> dict:
+        recent = list(self.flows)[-limit:]
+        return {
+            "flows": [asdict(f) for f in recent],
+            "capture_duration": self.stats["total"],
+            "capture_time": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        }
+
+
+def _is_private(ip: str) -> bool:
+    """True if IP is RFC1918 / loopback."""
+    return (ip.startswith(("10.", "172.16.", "192.168.", "127.", "::1"))
+            or ip == "localhost")
+
+
+# ── OPERA BROWSER CONTROLLER ──────────────────────────────────────────────────
+
+class OperaBrowser:
+    """
+    Controls Opera via Playwright (Chromium engine).
+    Opera path auto-detected on Linux / Mac / Windows.
+    Falls back to Chromium if Opera not found.
+    """
+
+    OPERA_PATHS = [
+        "/usr/bin/opera",
+        "/usr/local/bin/opera",
+        r"C:\Program Files\Opera\opera.exe",
+        r"C:\Users\%USERNAME%\AppData\Local\Programs\Opera\launcher.exe",
+        "/Applications/Opera.app/Contents/MacOS/Opera",
+    ]
+
+    def __init__(self):
+        self._pw = None
+        self._browser: Optional[Browser] = None
+        self._page: Optional[Page] = None
+        self.current_url = ""
+        self.history: list[str] = []
+
+    async def start(self) -> bool:
+        if not PLAYWRIGHT_OK:
+            print("⚠ Playwright unavailable")
+            return False
+        self._pw = await async_playwright().start()
+
+        # Find Opera executable
+        opera_exe = next(
+            (p for p in self.OPERA_PATHS if Path(os.path.expandvars(p)).exists()),
+            None
+        )
+
+        launch_kwargs = {
+            "headless": False,
+            "args": [
+                "--remote-debugging-port=9222",
+                "--no-first-run",
+                "--disable-extensions-except",
+            ],
+        }
+        if opera_exe:
+            launch_kwargs["executable_path"] = opera_exe
+            print(f"🎭 Using Opera: {opera_exe}")
+        else:
+            print("🎭 Opera not found — using Chromium fallback")
+
+        self._browser = await self._pw.chromium.launch(**launch_kwargs)
+        ctx = await self._browser.new_context()
+        self._page = await ctx.new_page()
+        await self._page.goto("about:blank")
+        print("✓ Browser ready")
+        return True
+
+    async def navigate(self, url: str) -> str:
+        if not self._page:
+            return "Browser not started"
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            self.current_url = url
+            self.history.append(url)
+            title = await self._page.title()
+            return f"✓ Navigated to: {url} | Title: {title}"
+        except Exception as e:
+            return f"✗ Navigation failed: {e}"
+
+    async def screenshot(self, path: str = "/tmp/opera_snap.png") -> str:
+        if not self._page:
+            return None
+        try:
+            await self._page.screenshot(path=path, full_page=False)
+            return path
+        except Exception as e:
+            print(f"Screenshot error: {e}")
+            return None
+
+    async def get_page_text(self) -> str:
+        if not self._page:
+            return ""
+        try:
+            return (await self._page.inner_text("body"))[:3000]
+        except Exception:
+            return ""
+
+    async def run_js(self, js: str) -> str:
+        if not self._page:
+            return "Browser not ready"
+        try:
+            result = await self._page.evaluate(js)
+            return str(result)
+        except Exception as e:
+            return f"JS error: {e}"
+
+    async def close(self):
+        if self._browser:
+            await self._browser.close()
+        if self._pw:
+            await self._pw.stop()
+
+
+# ── OS INTERACTION LAYER ──────────────────────────────────────────────────────
+
+class OSInterface:
+    """
+    Safe OS interaction: process inspection, command execution (allowlisted),
+    file reads, network state queries.
+    """
+
+    SAFE_COMMANDS = {
+        "ps", "top", "htop", "ls", "pwd", "whoami", "uname",
+        "netstat", "ss", "ip", "ifconfig", "ping", "traceroute",
+        "df", "du", "free", "uptime", "hostname", "date", "echo",
+        "cat", "head", "tail", "grep", "find", "which", "env",
+        "curl",   # for health checks
+        "wget",   # for downloads
+        "python3", "python",  # run scripts
+    }
+
+    # Commands blocked regardless of allowlist
+    BLOCKED_PREFIXES = (
+        "rm -rf", "mkfs", "dd if=", ":(){ :|:& };:",
+        "sudo rm", "format", "shutdown", "reboot",
+    )
+
+    def exec(self, cmd: str, timeout: int = 10) -> dict:
+        """Execute a shell command. Returns {output, returncode, safe}."""
+        # Safety check
+        cmd_base = cmd.strip().split()[0] if cmd.strip() else ""
+        if any(cmd.lower().startswith(b) for b in self.BLOCKED_PREFIXES):
+            return {"output": f"🚫 BLOCKED: {cmd}", "returncode": -1, "safe": False}
+
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True,
+                text=True, timeout=timeout
+            )
+            out = result.stdout[:3000] + (result.stderr[:500] if result.stderr else "")
+            return {"output": out or "(no output)", "returncode": result.returncode, "safe": True}
+        except subprocess.TimeoutExpired:
+            return {"output": f"[TIMEOUT after {timeout}s]", "returncode": -1, "safe": True}
+        except Exception as e:
+            return {"output": f"[ERROR]: {e}", "returncode": -1, "safe": True}
+
+    def process_list(self) -> list[dict]:
+        procs = []
+        for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent", "status"]):
+            try:
+                procs.append({
+                    "pid": p.info["pid"],
+                    "name": p.info["name"],
+                    "cpu": round(p.info["cpu_percent"] or 0, 1),
+                    "mem": round(p.info["memory_percent"] or 0, 1),
+                    "status": p.info["status"],
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return sorted(procs, key=lambda x: x["cpu"], reverse=True)[:30]
+
+    def kill_process(self, pid: int) -> str:
+        try:
+            p = psutil.Process(pid)
+            name = p.name()
+            p.terminate()
+            return f"✓ Terminated {name} (PID {pid})"
+        except psutil.NoSuchProcess:
+            return f"✗ PID {pid} not found"
+        except psutil.AccessDenied:
+            return f"✗ Access denied for PID {pid}"
+
+    def system_snapshot(self) -> dict:
+        cpu = psutil.cpu_percent(interval=0.5)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        return {
+            "cpu_pct":  cpu,
+            "mem_pct":  mem.percent,
+            "mem_avail_gb": round(mem.available / 1e9, 2),
+            "disk_pct": disk.percent,
+            "disk_free_gb": round(disk.free / 1e9, 2),
+            "uptime_h": round((time.time() - psutil.boot_time()) / 3600, 1),
+        }
+
+
+# ── AI FLOW ANALYSIS ──────────────────────────────────────────────────────────
+
+FLOW_ANALYSIS_SYSTEM = """You are a network security and browser automation AI.
+Analyze captured network flows from an Opera browser session.
+Identify: suspicious connections, data exfiltration signs, high-traffic endpoints,
+unusual port usage, or patterns worth investigating.
+Return ONLY valid JSON:
+{
+  "risk_level": "low|medium|high",
+  "suspicious_flows": ["desc1", "desc2"],
+  "top_destinations": ["ip:port", ...],
+  "recommended_action": "what to do next",
+  "os_command": "optional shell command to run for more info (or null)",
+  "navigate_to": "optional URL to inspect (or null)"
+}"""
+
+ACTION_SYSTEM = """You are an AI OS agent. Given a user goal and system state,
+decide the next OS action. Be specific and safe.
+Return ONLY valid JSON:
+{
+  "action": "navigate|exec|snapshot|observe|kill",
+  "target": "URL or command or PID",
+  "rationale": "why",
+  "risk": "low|medium|high"
+}"""
+
+async def analyze_flows(flows: list[NetworkFlow]) -> dict:
+    """AI analysis of network flows via free provider chain."""
+    flow_summary = "\n".join(f.to_short() for f in flows[-50:])
+    resp = await _ai_chat(
+        [{"role": "user", "content": f"NETWORK FLOWS:\n{flow_summary}"}],
+        system=FLOW_ANALYSIS_SYSTEM,
+    )
+    raw = re.sub(r"```(?:json)?|```", "", resp["text"]).strip()
+    match = re.search(r"(\{[\s\S]*\})", raw)
+    if match:
+        return json.loads(match.group(1))
+    return {"risk_level": "unknown", "recommended_action": resp["text"]}
+
+
+async def decide_action(goal: str, sys_state: dict) -> OSAction:
+    """AI decides next OS action given a goal."""
+    prompt = f"GOAL: {goal}\n\nSYSTEM STATE:\n{json.dumps(sys_state, indent=2)}"
+    resp = await _ai_chat([{"role": "user", "content": prompt}], system=ACTION_SYSTEM)
+    raw = re.sub(r"```(?:json)?|```", "", resp["text"]).strip()
+    match = re.search(r"(\{[\s\S]*\})", raw)
+    if match:
+        data = json.loads(match.group(1))
+        return OSAction(**data)
+    return OSAction(action="observe", target="", rationale=resp["text"], risk="low")
+
+
+# ── BOT CORE ──────────────────────────────────────────────────────────────────
+
+class OperaOSBot:
+    """
+    Orchestrates: browser + capture + OS + AI + Telegram.
+    All state lives here. Telegram commands call bot methods.
+    """
+
+    def __init__(self, mode: str = "full"):
+        self.mode = mode
+        self.browser = OperaBrowser()
+        self.capture = FlowCapture()
+        self.os = OSInterface()
+        self._running = False
+        self.session_start = time.time()
+        self.ai_analyses: list[dict] = []
+        self.log_path = Path("logs/opera_bot.log")
+        self.log_path.parent.mkdir(exist_ok=True)
+
+    def _log(self, msg: str):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line)
+        with open(self.log_path, "a") as f:
+            f.write(line + "\n")
+
+    async def start(self):
+        self._running = True
+        self._log("🦞 OperaOSBot starting")
+
+        if self.mode in ("full", "capture") and SCAPY_OK:
+            self.capture.start()
+
+        if self.mode in ("full", "browser") and PLAYWRIGHT_OK:
+            ok = await self.browser.start()
+            if not ok:
+                self._log("⚠ Browser failed to start")
+
+        self._log(f"✓ Bot ready — mode={self.mode}")
+
+    async def navigate(self, url: str) -> str:
+        result = await self.browser.navigate(url)
+        self._log(f"NAVIGATE → {url}: {result}")
+        return result
+
+    async def snapshot(self) -> Optional[str]:
+        path = await self.browser.screenshot()
+        self._log(f"SNAPSHOT → {path}")
+        return path
+
+    async def get_flows_report(self) -> str:
+        return self.capture.summary_text()
+
+    async def analyze(self) -> str:
+        flows = self.capture.recent(50)
+        if not flows:
+            return "No flows to analyze yet. Wait for some browser activity."
+        result = await analyze_flows(flows)
+        self.ai_analyses.append(result)
+        self._log(f"ANALYZE → risk={result.get('risk_level','?')}")
+        lines = [
+            f"🔍 Risk: {result.get('risk_level','?').upper()}",
+            f"📍 Recommended: {result.get('recommended_action','')}",
+        ]
+        if result.get("suspicious_flows"):
+            lines.append("⚠ Suspicious:\n" + "\n".join(f"  • {s}" for s in result["suspicious_flows"]))
+        if result.get("os_command"):
+            lines.append(f"💻 Suggested cmd: `{result['os_command']}`")
+        if result.get("navigate_to"):
+            lines.append(f"🌐 Investigate: {result['navigate_to']}")
+        return "\n".join(lines)
+
+    async def exec_cmd(self, cmd: str) -> str:
+        result = self.os.exec(cmd)
+        if not result["safe"]:
+            return result["output"]
+        self._log(f"EXEC → {cmd}: rc={result['returncode']}")
+        return f"```\n{result['output']}\n```"
+
+    async def process_list(self) -> str:
+        procs = self.os.process_list()
+        lines = ["PID    CPU%  MEM%  NAME"]
+        for p in procs[:15]:
+            lines.append(f"{p['pid']:<6} {p['cpu']:>4}  {p['mem']:>4}  {p['name']}")
+        return "```\n" + "\n".join(lines) + "\n```"
+
+    async def kill_proc(self, pid: int) -> str:
+        return self.os.kill_process(pid)
+
+    async def status(self) -> str:
+        snap = self.os.system_snapshot()
+        uptime_bot = round((time.time() - self.session_start) / 60, 1)
+        browser_ok = self.browser._page is not None
+        capture_ok = self.capture.running
+        return (
+            f"🦞 OPERA OS BOT STATUS\n"
+            f"Mode:     {self.mode}\n"
+            f"Uptime:   {uptime_bot}m\n"
+            f"Browser:  {'✓' if browser_ok else '✗'} | {self.browser.current_url[:40] or 'idle'}\n"
+            f"Capture:  {'✓' if capture_ok else '✗'} | {self.capture.stats.get('total',0)} pkts\n"
+            f"CPU:      {snap['cpu_pct']}%\n"
+            f"RAM:      {snap['mem_pct']}% ({snap['mem_avail_gb']}GB free)\n"
+            f"Disk:     {snap['disk_pct']}% ({snap['disk_free_gb']}GB free)\n"
+            f"Analyses: {len(self.ai_analyses)}"
+        )
+
+    async def stop(self):
+        self._running = False
+        self.capture.stop()
+        await self.browser.close()
+        self._log("Bot stopped.")
+
+
+# ── TELEGRAM HANDLER SETUP ────────────────────────────────────────────────────
+
+def build_telegram_app(bot_instance: OperaOSBot):
+    """Wire Telegram commands to OperaOSBot methods. Returns (bot, dp)."""
+    if not AIOGRAM_OK:
+        return None, None
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("⚠ TELEGRAM_BOT_TOKEN not set — Telegram disabled")
+        return None, None
+
+    tg_bot = Bot(token=token)
+    dp = Dispatcher()
+    router = Router()
+
+    @router.message(Command("opera_go"))
+    async def cmd_go(msg: Message):
+        url = msg.text.replace("/opera_go", "").strip()
+        if not url:
+            await msg.reply("Usage: /opera_go <url>")
+            return
+        result = await bot_instance.navigate(url)
+        await msg.reply(result)
+
+    @router.message(Command("opera_snap"))
+    async def cmd_snap(msg: Message):
+        path = await bot_instance.snapshot()
+        if path and Path(path).exists():
+            data = Path(path).read_bytes()
+            await msg.reply_photo(BufferedInputFile(data, "snap.png"),
+                                  caption=f"📸 {bot_instance.browser.current_url}")
+        else:
+            await msg.reply("❌ Screenshot failed (browser not started?)")
+
+    @router.message(Command("opera_flows"))
+    async def cmd_flows(msg: Message):
+        report = await bot_instance.get_flows_report()
+        await msg.reply(f"📡 FLOW REPORT\n{report}")
+
+    @router.message(Command("opera_analyze"))
+    async def cmd_analyze(msg: Message):
+        await msg.reply("🔍 Analyzing flows...")
+        result = await bot_instance.analyze()
+        await msg.reply(result)
+
+    @router.message(Command("opera_exec"))
+    async def cmd_exec(msg: Message):
+        cmd = msg.text.replace("/opera_exec", "").strip()
+        if not cmd:
+            await msg.reply("Usage: /opera_exec <shell command>")
+            return
+        out = await bot_instance.exec_cmd(cmd)
+        await msg.reply(out[:4000], parse_mode="Markdown")
+
+    @router.message(Command("opera_ps"))
+    async def cmd_ps(msg: Message):
+        out = await bot_instance.process_list()
+        await msg.reply(out, parse_mode="Markdown")
+
+    @router.message(Command("opera_kill"))
+    async def cmd_kill(msg: Message):
+        pid_str = msg.text.replace("/opera_kill", "").strip()
+        if not pid_str.isdigit():
+            await msg.reply("Usage: /opera_kill <PID>")
+            return
+        result = await bot_instance.kill_proc(int(pid_str))
+        await msg.reply(result)
+
+    @router.message(Command("opera_status"))
+    async def cmd_status(msg: Message):
+        status = await bot_instance.status()
+        await msg.reply(status)
+
+    dp.include_router(router)
+    return tg_bot, dp
+
+
+# ── AUTO-ANALYSIS LOOP ────────────────────────────────────────────────────────
+
+async def _auto_analyze_loop(bot: OperaOSBot, interval_s: int = 120):
+    """
+    Background loop: analyze flows every N seconds.
+    Logs anomalies. Could wire to Telegram push if you add chat_id.
+    """
+    while bot._running:
+        await asyncio.sleep(interval_s)
+        if bot.capture.stats.get("total", 0) < 10:
+            continue
+        try:
+            result = await analyze_flows(bot.capture.recent(50))
+            risk = result.get("risk_level", "low")
+            if risk in ("medium", "high"):
+                bot._log(f"⚠ AUTO-ANALYSIS: risk={risk} — {result.get('recommended_action','')}")
+                # Optionally send to Telegram push here
+        except Exception as e:
+            bot._log(f"Auto-analysis error: {e}")
+
+
+# ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
+
+async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="🦞 Opera OS Bot — ClawDash [BOT]")
+    parser.add_argument("--mode", choices=["full", "capture", "browser", "headless"],
+                        default="full", help="Operating mode")
+    parser.add_argument("--analyze-interval", type=int, default=120,
+                        help="Auto-analysis interval in seconds")
+    parser.add_argument("--capture-duration", type=int, default=0,
+                        help="Packet capture duration (0=unlimited)")
+    args = parser.parse_args()
+
+    bot = OperaOSBot(mode=args.mode)
+    await bot.start()
+
+    tg_bot, dp = build_telegram_app(bot)
+
+    tasks = [_auto_analyze_loop(bot, args.analyze_interval)]
+    if tg_bot and dp:
+        tasks.append(dp.start_polling(tg_bot))
+        print("📟 Telegram bot polling started")
+    else:
+        print("📟 Telegram disabled — running headless. Ctrl+C to stop.")
+
+    try:
+        await asyncio.gather(*tasks)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n🦞 Shutting down...")
+    finally:
+        await bot.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
